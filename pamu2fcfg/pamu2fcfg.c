@@ -1,207 +1,388 @@
 /*
- * Copyright (C) 2014 Yubico AB - See COPYING
+ * Copyright (C) 2014-2021 Yubico AB - See COPYING
  */
-
-#include <u2f-server/u2f-server.h>
-#include <u2f-host/u2f-host.h>
 
 #define BUFSIZE 1024
 #define PAM_PREFIX "pam://"
 #define TIMEOUT 15
 #define FREQUENCY 1
 
+#include <fido.h>
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <getopt.h>
 #include <unistd.h>
+#include <sys/types.h>
+#include <pwd.h>
 
+#include "b64.h"
 #include "cmdline.h"
+#include "util.h"
 
-int main(int argc, char *argv[])
-{
-  int exit_code = EXIT_FAILURE;
-  struct gengetopt_args_info args_info;
-  char buf[BUFSIZE];
-  char *p;
-  char *response;
-  u2fs_ctx_t *ctx;
-  u2fs_reg_res_t *reg_result;
-  u2fs_rc s_rc;
-  u2fh_rc h_rc;
-  char *origin = NULL;
+#include "openbsd-compat.h"
+
+static fido_cred_t *prepare_cred(const struct gengetopt_args_info *const args) {
+  fido_cred_t *cred = NULL;
+  fido_opt_t resident_key;
   char *appid = NULL;
   char *user = NULL;
-  const char *kh = NULL;
-  const char *pk = NULL;
-  u2fh_devs *devs = NULL;
-  unsigned i;
-  unsigned max_index = 0;
+  struct passwd *passwd;
+  unsigned char userid[32];
+  unsigned char cdh[32];
+  char origin[BUFSIZE];
+  int type;
+  int ok = -1;
+  size_t n;
+  int r;
 
+  if ((cred = fido_cred_new()) == NULL) {
+    fprintf(stderr, "fido_cred_new failed\n");
+    goto err;
+  }
 
+  type = COSE_ES256; /* default */
+  if (args->type_given) {
+    if (!cose_type(args->type_arg, &type)) {
+      fprintf(stderr, "Unknown COSE type '%s'.\n", args->type_arg);
+      goto err;
+    }
+  }
+
+  if ((r = fido_cred_set_type(cred, type)) != FIDO_OK) {
+    fprintf(stderr, "error: fido_cred_set_type (%d): %s\n", r, fido_strerr(r));
+    goto err;
+  }
+
+  if (!random_bytes(cdh, sizeof(cdh))) {
+    fprintf(stderr, "random_bytes failed\n");
+    goto err;
+  }
+
+  if ((r = fido_cred_set_clientdata_hash(cred, cdh, sizeof(cdh))) != FIDO_OK) {
+    fprintf(stderr, "error: fido_cred_set_clientdata_hash (%d): %s\n", r,
+            fido_strerr(r));
+    goto err;
+  }
+
+  if (args->origin_given) {
+    if (strlcpy(origin, args->origin_arg, sizeof(origin)) >= sizeof(origin)) {
+      fprintf(stderr, "error: strlcpy failed\n");
+      goto err;
+    }
+  } else {
+    if ((n = strlcpy(origin, PAM_PREFIX, sizeof(origin))) >= sizeof(origin)) {
+      fprintf(stderr, "error: strlcpy failed\n");
+      goto err;
+    }
+    if (gethostname(origin + n, sizeof(origin) - n) == -1) {
+      perror("gethostname");
+      goto err;
+    }
+  }
+
+  if (args->appid_given) {
+    appid = args->appid_arg;
+  } else {
+    appid = origin;
+  }
+
+  if (args->verbose_given) {
+    fprintf(stderr, "Setting origin to %s\n", origin);
+    fprintf(stderr, "Setting appid to %s\n", appid);
+  }
+
+  if ((r = fido_cred_set_rp(cred, origin, appid)) != FIDO_OK) {
+    fprintf(stderr, "error: fido_cred_set_rp (%d) %s\n", r, fido_strerr(r));
+    goto err;
+  }
+
+  if (args->username_given) {
+    user = args->username_arg;
+  } else {
+    if ((passwd = getpwuid(getuid())) == NULL) {
+      perror("getpwuid");
+      goto err;
+    }
+    user = passwd->pw_name;
+  }
+
+  if (!random_bytes(userid, sizeof(userid))) {
+    fprintf(stderr, "random_bytes failed\n");
+    goto err;
+  }
+
+  if (args->verbose_given) {
+    fprintf(stderr, "Setting user to %s\n", user);
+    fprintf(stderr, "Setting user id to ");
+    for (size_t i = 0; i < sizeof(userid); i++)
+      fprintf(stderr, "%02x", userid[i]);
+    fprintf(stderr, "\n");
+  }
+
+  if ((r = fido_cred_set_user(cred, userid, sizeof(userid), user, user,
+                              NULL)) != FIDO_OK) {
+    fprintf(stderr, "error: fido_cred_set_user (%d) %s\n", r, fido_strerr(r));
+    goto err;
+  }
+
+  if (args->resident_given) {
+    resident_key = FIDO_OPT_TRUE;
+  } else {
+    resident_key = FIDO_OPT_OMIT;
+  }
+
+  if ((r = fido_cred_set_rk(cred, resident_key)) != FIDO_OK) {
+    fprintf(stderr, "error: fido_cred_set_rk (%d) %s\n", r, fido_strerr(r));
+    goto err;
+  }
+
+  if ((r = fido_cred_set_uv(cred, FIDO_OPT_OMIT)) != FIDO_OK) {
+    fprintf(stderr, "error: fido_cred_set_uv (%d) %s\n", r, fido_strerr(r));
+    goto err;
+  }
+
+  ok = 0;
+
+err:
+  if (ok != 0) {
+    fido_cred_free(&cred);
+  }
+
+  return cred;
+}
+
+static int make_cred(const char *path, fido_dev_t *dev, fido_cred_t *cred) {
+  char prompt[BUFSIZE];
+  char pin[BUFSIZE];
+  int n;
+  int r;
+
+  if (path == NULL || dev == NULL || cred == NULL) {
+    fprintf(stderr, "%s: args\n", __func__);
+    return -1;
+  }
+
+  r = fido_dev_make_cred(dev, cred, NULL);
+  if (r == FIDO_ERR_PIN_REQUIRED) {
+    n = snprintf(prompt, sizeof(prompt), "Enter PIN for %s: ", path);
+    if (n < 0 || (size_t) n >= sizeof(prompt)) {
+      fprintf(stderr, "error: snprintf prompt");
+      return -1;
+    }
+    if (!readpassphrase(prompt, pin, sizeof(pin), RPP_ECHO_OFF)) {
+      fprintf(stderr, "error: failed to read pin");
+      explicit_bzero(pin, sizeof(pin));
+      return -1;
+    }
+    r = fido_dev_make_cred(dev, cred, pin);
+  }
+  explicit_bzero(pin, sizeof(pin));
+
+  if (r != FIDO_OK) {
+    fprintf(stderr, "error: fido_dev_make_cred (%d) %s\n", r, fido_strerr(r));
+    return -1;
+  }
+
+  return 0;
+}
+
+static int verify_cred(const fido_cred_t *const cred) {
+  int r;
+
+  if (cred == NULL) {
+    fprintf(stderr, "%s: args\n", __func__);
+    return -1;
+  }
+
+  if (fido_cred_x5c_ptr(cred) == NULL) {
+    if ((r = fido_cred_verify_self(cred)) != FIDO_OK) {
+      fprintf(stderr, "error: fido_cred_verify_self (%d) %s\n", r,
+              fido_strerr(r));
+      return -1;
+    }
+  } else {
+    if ((r = fido_cred_verify(cred)) != FIDO_OK) {
+      fprintf(stderr, "error: fido_cred_verify (%d) %s\n", r, fido_strerr(r));
+      return -1;
+    }
+  }
+
+  return 0;
+}
+
+static int print_authfile_line(const struct gengetopt_args_info *const args,
+                               const fido_cred_t *const cred) {
+  const unsigned char *kh = NULL;
+  const unsigned char *pk = NULL;
+  const char *user = NULL;
+  char *b64_kh = NULL;
+  char *b64_pk = NULL;
+  size_t kh_len;
+  size_t pk_len;
+  int ok = -1;
+
+  if ((kh = fido_cred_id_ptr(cred)) == NULL) {
+    fprintf(stderr, "error: fido_cred_id_ptr returned NULL\n");
+    goto err;
+  }
+
+  if ((kh_len = fido_cred_id_len(cred)) == 0) {
+    fprintf(stderr, "error: fido_cred_id_len returned 0\n");
+    goto err;
+  }
+
+  if ((pk = fido_cred_pubkey_ptr(cred)) == NULL) {
+    fprintf(stderr, "error: fido_cred_pubkey_ptr returned NULL\n");
+    goto err;
+  }
+
+  if ((pk_len = fido_cred_pubkey_len(cred)) == 0) {
+    fprintf(stderr, "error: fido_cred_pubkey_len returned 0\n");
+    goto err;
+  }
+
+  if (!b64_encode(kh, kh_len, &b64_kh)) {
+    fprintf(stderr, "error: failed to encode key handle\n");
+    goto err;
+  }
+
+  if (!b64_encode(pk, pk_len, &b64_pk)) {
+    fprintf(stderr, "error: failed to encode public key\n");
+    goto err;
+  }
+
+  if (!args->nouser_given) {
+    if ((user = fido_cred_user_name(cred)) == NULL) {
+      fprintf(stderr, "error: fido_cred_user_name returned NULL\n");
+      goto err;
+    }
+    printf("%s", user);
+  }
+
+  printf(":%s,%s,%s,%s%s%s", args->resident_given ? "*" : b64_kh, b64_pk,
+         cose_string(fido_cred_type(cred)),
+         !args->no_user_presence_given ? "+presence" : "",
+         args->user_verification_given ? "+verification" : "",
+         args->pin_verification_given ? "+pin" : "");
+
+  ok = 0;
+
+err:
+  free(b64_kh);
+  free(b64_pk);
+
+  return ok;
+}
+
+int main(int argc, char *argv[]) {
+  int exit_code = EXIT_FAILURE;
+  struct gengetopt_args_info args_info;
+  fido_cred_t *cred = NULL;
+  fido_dev_info_t *devlist = NULL;
+  fido_dev_t *dev = NULL;
+  const fido_dev_info_t *di = NULL;
+  const char *path = NULL;
+  size_t ndevs = 0;
+  int r;
+
+  /* NOTE: initializes args_info. on error, frees args_info and calls exit() */
   if (cmdline_parser(argc, argv, &args_info) != 0)
-    exit(EXIT_FAILURE);
+    goto err;
 
   if (args_info.help_given) {
     cmdline_parser_print_help();
-    printf
-        ("\nReport bugs at <https://github.com/Yubico/libu2f-server>.\n");
-    exit(EXIT_SUCCESS);
+    printf("\nReport bugs at <https://github.com/Yubico/pam-u2f>.\n");
+    exit_code = EXIT_SUCCESS;
+    goto err;
   }
 
-  s_rc = u2fs_global_init(args_info.debug_flag ? U2FS_DEBUG : 0);
-  if (s_rc != U2FS_OK) {
-    fprintf(stderr, "error: u2fs_global_init (%d): %s\n", s_rc,
-            u2fs_strerror(s_rc));
-    exit(EXIT_FAILURE);
+  fido_init(args_info.debug_flag ? FIDO_DEBUG : 0);
+
+  if ((cred = prepare_cred(&args_info)) == NULL)
+    goto err;
+
+  devlist = fido_dev_info_new(64);
+  if (!devlist) {
+    fprintf(stderr, "error: fido_dev_info_new failed\n");
+    goto err;
   }
 
-  s_rc = u2fs_init(&ctx);
-  if (s_rc != U2FS_OK) {
-    fprintf(stderr, "error: u2fs_init (%d): %s\n", s_rc,
-            u2fs_strerror(s_rc));
-    exit(EXIT_FAILURE);
+  r = fido_dev_info_manifest(devlist, 64, &ndevs);
+  if (r != FIDO_OK) {
+    fprintf(stderr, "Unable to discover device(s), %s (%d)\n", fido_strerr(r),
+            r);
+    goto err;
   }
 
-  if (args_info.origin_given)
-    origin = args_info.origin_arg;
-  else {
-    if (!strcpy(buf, PAM_PREFIX))
-      fprintf(stderr, "strcpy failed\n");
-    if (gethostname(buf + strlen(PAM_PREFIX), BUFSIZE - strlen(PAM_PREFIX))
-        == -1) {
-      perror("gethostname");
-      exit(EXIT_FAILURE);
-    }
-    origin = buf;
-  }
-
-  s_rc = u2fs_set_origin(ctx, origin);
-  if (s_rc != U2FS_OK) {
-    printf("error: u2fs_set_origin (%d): %s\n", s_rc, u2fs_strerror(s_rc));
-    exit(EXIT_FAILURE);
-  }
-
-  if (args_info.appid_given)
-    appid = args_info.appid_arg;
-  else {
-    if (args_info.origin_given) {
-      if (!strcpy(buf, PAM_PREFIX))
-        fprintf(stderr, "strcpy failed\n");
-      if (gethostname
-          (buf + strlen(PAM_PREFIX), BUFSIZE - strlen(PAM_PREFIX)) == -1) {
-        perror("gethostname");
-        exit(EXIT_FAILURE);
-      }
-    }
-    appid = buf;
-  }
-
-  s_rc = u2fs_set_appid(ctx, appid);
-  if (s_rc != U2FS_OK) {
-    fprintf(stderr, "error: u2fs_set_appid (%d): %s\n", s_rc,
-            u2fs_strerror(s_rc));
-    exit(EXIT_FAILURE);
-  }
-
-  if (args_info.username_given)
-    user = args_info.username_arg;
-  else {
-    user = getlogin();
-    if (!user) {
-      perror("gethostname");
-      exit(EXIT_FAILURE);
-    }
-  }
-
-  if (u2fh_global_init(args_info.debug_flag ? U2FS_DEBUG : 0) != U2FH_OK
-      || u2fh_devs_init(&devs) != U2FH_OK) {
-    fprintf(stderr, "Unable to initialize libu2f-host");
-    exit(EXIT_FAILURE);
-  }
-
-  h_rc = u2fh_devs_discover(devs, &max_index);
-  if (h_rc != U2FH_OK && h_rc != U2FH_NO_U2F_DEVICE) {
-    fprintf(stderr, "Unable to discover device(s), %s (%d)",
-            u2fh_strerror(h_rc), h_rc);
-    exit(EXIT_FAILURE);
-  }
-
-  if (h_rc == U2FH_NO_U2F_DEVICE) {
-    for (i = 0; i < TIMEOUT; i += FREQUENCY) {
+  if (ndevs == 0) {
+    for (int i = 0; i < TIMEOUT; i += FREQUENCY) {
       fprintf(stderr,
-              "\rNo U2F device available, please insert one now, you have %2d seconds",
+              "\rNo U2F device available, please insert one now, you "
+              "have %2d seconds",
               TIMEOUT - i);
       fflush(stderr);
       sleep(FREQUENCY);
 
-      h_rc = u2fh_devs_discover(devs, &max_index);
-      if (h_rc == U2FH_OK) {
-        fprintf(stderr, "\nDevice found!\n");
-        break;
+      r = fido_dev_info_manifest(devlist, 64, &ndevs);
+      if (r != FIDO_OK) {
+        fprintf(stderr, "\nUnable to discover device(s), %s (%d)",
+                fido_strerr(r), r);
+        goto err;
       }
 
-      if (h_rc != U2FH_NO_U2F_DEVICE) {
-        fprintf(stderr, "\nUnable to discover device(s), %s (%d)",
-                u2fh_strerror(h_rc), h_rc);
-        exit(EXIT_FAILURE);
+      if (ndevs != 0) {
+        fprintf(stderr, "\nDevice found!\n");
+        break;
       }
     }
   }
 
-  if (h_rc != U2FH_OK) {
-    fprintf(stderr,
-            "\rNo device found. Aborting.                                         \n");
-    exit(EXIT_FAILURE);
+  if (ndevs == 0) {
+    fprintf(stderr, "\rNo device found. Aborting.                              "
+                    "           \n");
+    goto err;
   }
 
-  s_rc = u2fs_registration_challenge(ctx, &p);
-  if (s_rc != U2FS_OK) {
-    fprintf(stderr, "Unable to generate registration challenge, %s (%d)",
-            u2fs_strerror(s_rc), s_rc);
-    exit(EXIT_FAILURE);
+  /* XXX loop over every device? */
+  dev = fido_dev_new();
+  if (!dev) {
+    fprintf(stderr, "fido_dev_new failed\n");
+    goto err;
   }
 
-  h_rc =
-      u2fh_register(devs, p, origin, &response,
-                    U2FH_REQUEST_USER_PRESENCE);
-  if (s_rc != U2FS_OK) {
-    fprintf(stderr, "Unable to generate registration challenge, %s (%d)",
-            u2fs_strerror(s_rc), s_rc);
-    exit(EXIT_FAILURE);
+  di = fido_dev_info_ptr(devlist, 0);
+  if (!di) {
+    fprintf(stderr, "error: fido_dev_info_ptr returned NULL\n");
+    goto err;
   }
 
-  s_rc = u2fs_registration_verify(ctx, response, &reg_result);
-  if (s_rc != U2FS_OK) {
-    fprintf(stderr, "error: (%d) %s\n", s_rc, u2fs_strerror(s_rc));
-    exit(EXIT_FAILURE);
+  if ((path = fido_dev_info_path(di)) == NULL) {
+    fprintf(stderr, "error: fido_dev_path returned NULL\n");
+    goto err;
   }
 
-  kh = u2fs_get_registration_keyHandle(reg_result);
-  if (!kh) {
-    fprintf(stderr, "Unable to extract keyHandle: (%d) %s\n", s_rc,
-            u2fs_strerror(s_rc));
-    exit(EXIT_FAILURE);
+  r = fido_dev_open(dev, path);
+  if (r != FIDO_OK) {
+    fprintf(stderr, "error: fido_dev_open (%d) %s\n", r, fido_strerr(r));
+    goto err;
   }
 
-  pk = u2fs_get_registration_publicKey(reg_result);
-  if (!pk) {
-    fprintf(stderr, "Unable to extract public key: (%d) %s\n", s_rc,
-            u2fs_strerror(s_rc));
-    exit(EXIT_FAILURE);
-  }
-
-  if (!args_info.nouser_given)
-    printf("%s", user);
-
-  printf(":%s,", kh);
-  for (i = 0; i < U2FS_PUBLIC_KEY_LEN; i++) {
-    printf("%02x", pk[i] & 0xFF);
-  }
+  if (make_cred(path, dev, cred) != 0 || verify_cred(cred) != 0 ||
+      print_authfile_line(&args_info, cred) != 0)
+    goto err;
 
   exit_code = EXIT_SUCCESS;
 
-  u2fs_done(ctx);
-  u2fs_global_done();
+err:
+  if (dev != NULL)
+    fido_dev_close(dev);
+  fido_dev_info_free(&devlist, ndevs);
+  fido_cred_free(&cred);
+  fido_dev_free(&dev);
+
+  cmdline_parser_free(&args_info);
+
   exit(exit_code);
 }

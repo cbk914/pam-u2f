@@ -4,7 +4,9 @@
 *.o
 *.trs
 *~
+*.cred
 .deps
+.dirstamp
 .libs
 ChangeLog
 INSTALL
@@ -12,6 +14,7 @@ Makefile
 Makefile.in
 aclocal.m4
 autom4te.cache/
+build/
 build-aux/ar-lib
 build-aux/compile
 build-aux/config.guess
@@ -36,6 +39,11 @@ tests/Makefile
 tests/Makefile.in
 tests/basic
 pam_u2f.la
-pam_u2f.8
+man/pam_u2f.8
+pamu2fcfg/cmdline.c
+pamu2fcfg/cmdline.h
 pamu2fcfg/pamu2fcfg
-pamu2fcfg/pamu2fcfg.1
+man/pamu2fcfg.1
+tests/get_devices
+fuzz/Makefile
+fuzz/fuzz_format_parsers
